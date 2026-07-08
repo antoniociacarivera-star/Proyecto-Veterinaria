@@ -1,10 +1,12 @@
 import oracledb
-import time
 import os
+import json
+import time
+import stomp
 from dotenv import load_dotenv
 
-# Buscamos el archivo con su nombre corregido
-RUTA_ENTORNO = r"C:\Users\ciari\OneDrive\Desktop\Yventz\config.env"
+# Carga de variables de entorno
+RUTA_ENTORNO = r"C:\Users\ciari\OneDrive\Desktop\Proyecto profe\config.env"
 load_dotenv(dotenv_path=RUTA_ENTORNO)
 
 DB_USER = os.getenv("DB_USER")
@@ -12,54 +14,52 @@ DB_PASS = os.getenv("DB_PASS")
 DB_DSN = os.getenv("DB_DSN")
 CARPETA_COLA = os.getenv("CARPETA_COLA")
 
-print("=" * 60)
-print("SISTEMA OUTBOX ACTIVO - ENVIANDO MENSAJES A COLA LOCAL")
-print("=" * 60)
+if not os.path.exists(CARPETA_COLA):
+    os.makedirs(CARPETA_COLA)
 
-# El resto de tu código hacia abajo sigue exactamente igual...
+print("Proceso de sincronización iniciado. Escuchando base de datos...")
 
-def guardar_en_cola_local(id_evento, payload):
-    try:
-        nombre_archivo = f"mensaje_vet1_{id_evento}.json"
-        ruta_completa = os.path.join(CARPETA_COLA, nombre_archivo)
-        
-        with open(ruta_completa, "w", encoding="utf-8") as f:
-            f.write(payload)
-            
-        print(f"    [💾] Mensaje exportado con éxito a la cola: {nombre_archivo}")
-        return True
-    except Exception as e:
-        print(f"[❌ Error al escribir el archivo]: {e}")
-        return False
-
-def revisar_tabla_outbox():
-    try:
-        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT ID_EVENTO, CONTENIDO_JSON FROM VET1 ORDER BY ID_EVENTO ASC")
-        eventos = cursor.fetchall()
-        
-        if eventos:
-            print(f"\n[📦] ¡Se detectaron {len(eventos)} mensajes nuevos en VET1!")
-            
-            for id_evento, contenido_json in eventos:
-                payload = contenido_json.read() if hasattr(contenido_json, 'read') else str(contenido_json)
-                print(f" -> Despachando Evento ID {id_evento}...")
-                
-                if guardar_en_cola_local(id_evento, payload):
-                    cursor.execute("DELETE FROM VET1 WHERE ID_EVENTO = :1", [id_evento])
-                    print(f"    [✔️] Evento {id_evento} eliminado de la base de datos.")
-            
-            conn.commit()
-        else:
-            print("[💤] No hay datos nuevos en la tabla VET1. Reintentando en 3 segundos...")
-            
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        print(f"[❌ Error de Oracle]: {e}")
+ids_procesados = set()
 
 while True:
-    revisar_tabla_outbox()
-    time.sleep(3)
+    try:
+        connection = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cursor = connection.cursor()
+        
+        # Lectura de los registros almacenados
+        cursor.execute("SELECT ID_EVENTO, TIPO_EVENTO, CONTENIDO_JSON FROM VET1 ORDER BY ID_EVENTO ASC")
+        filas = cursor.fetchall()
+        
+        for fila in filas:
+            id_evento = fila[0]
+            tipo_evento = fila[1]
+            contenido_json = fila[2]
+            
+            if id_evento not in ids_procesados:
+                nombre_archivo = f"mensaje_{tipo_evento}_{id_evento}.json"
+                ruta_archivo = os.path.join(CARPETA_COLA, nombre_archivo)
+                
+                datos = json.loads(contenido_json)
+                with open(ruta_archivo, "w", encoding="utf-8") as f:
+                    json.dump(datos, f, indent=4, ensure_ascii=False)
+                
+                # Generación del formato de notificación para ActiveMQ
+                nombre_mascota = datos.get("mascota", "Paciente")
+                diagnostico = datos.get("diagnostico", "Consulta")
+                
+                mensaje_chat = f"Notificación: Su mascota {nombre_mascota} ya se encuentra registrada para su atención médica (Motivo: {diagnostico})."
+                
+                ruta_chat = os.path.join(CARPETA_COLA, "historial_chat.txt")
+                with open(ruta_chat, "a", encoding="utf-8") as ch:
+                    ch.write(mensaje_chat + "\n")
+                
+                print(f"Registro #{id_evento} procesado y enviado a cola de mensajería externa.")
+                ids_procesados.add(id_evento)
+        
+        cursor.close()
+        connection.close()
+        
+    except Exception as e:
+        print(f"Error de procesamiento: {e}")
+        
+    time.sleep(2)
